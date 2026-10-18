@@ -1,0 +1,175 @@
+name: Build Flutter APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_url:
+        description: "URL ZIP proyek Flutter (kosongkan untuk memakai repository ini)"
+        required: false
+        type: string
+        default: ""
+      tag:
+        description: "Nama artifact build"
+        required: true
+        type: string
+        default: "v1.0.0"
+      build_type:
+        description: "Jenis build APK"
+        required: true
+        type: choice
+        options:
+          - release
+          - debug
+        default: release
+      only_analyze:
+        description: "Hanya jalankan flutter analyze"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      ZIP_URL: ${{ inputs.zip_url }}
+      BUILD_TYPE: ${{ inputs.build_type }}
+      ONLY_ANALYZE: ${{ inputs.only_analyze }}
+
+    steps:
+      - name: Checkout repository project
+        if: ${{ inputs.zip_url == '' }}
+        uses: actions/checkout@v4
+
+      - name: Download and validate ZIP project
+        if: ${{ inputs.zip_url != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=(--fail --location --silent --show-error --retry 3)
+          if [[ -n "${GH_TOKEN:-}" ]]; then
+            args+=(--header "Authorization: Bearer ${GH_TOKEN}")
+          fi
+          curl "${args[@]}" "$ZIP_URL" --output "$RUNNER_TEMP/project.zip"
+
+          if ! file "$RUNNER_TEMP/project.zip" | grep -qi 'zip archive'; then
+            echo "::error::URL tidak mengembalikan file ZIP. Periksa URL ZIP dan izin akses repository."
+            echo "Respons awal server:"
+            head -c 300 "$RUNNER_TEMP/project.zip" || true
+            exit 1
+          fi
+          unzip -t "$RUNNER_TEMP/project.zip" >/dev/null
+          mkdir -p "$RUNNER_TEMP/project_extracted"
+          unzip -q "$RUNNER_TEMP/project.zip" -d "$RUNNER_TEMP/project_extracted"
+          echo "ZIP_PROJECT_DIR=$RUNNER_TEMP/project_extracted" >> "$GITHUB_ENV"
+
+      - name: Select project root
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE="${ZIP_PROJECT_DIR:-$GITHUB_WORKSPACE}"
+
+          PROJECT="$(find "$BASE" \
+            -type d \( -name .git -o -name build -o -name .dart_tool -o -name .idea \) -prune -o \
+            -type f -name pubspec.yaml -print \
+            | sort | head -n 1 | xargs -r dirname)"
+
+          if [[ -z "$PROJECT" ]]; then
+            GRADLE_FILE="$(find "$BASE" \
+              -type d \( -name .git -o -name build -o -name .gradle \) -prune -o \
+              -type f -name gradlew -print \
+              | sort | head -n 1)"
+            if [[ -n "$GRADLE_FILE" ]]; then
+              PROJECT="$(dirname "$GRADLE_FILE")"
+            fi
+          fi
+
+          if [[ -z "$PROJECT" ]]; then
+            echo "::error::Tidak ditemukan pubspec.yaml atau gradlew."
+            echo "File yang tersedia (maksimal 100):"
+            find "$BASE" -maxdepth 5 -type f | head -100 || true
+            exit 1
+          fi
+
+          echo "PROJECT_DIR=$PROJECT" >> "$GITHUB_ENV"
+          echo "Project root: $PROJECT"
+          if [[ -f "$PROJECT/pubspec.yaml" ]]; then
+            echo "PROJECT_KIND=flutter" >> "$GITHUB_ENV"
+            echo "Project type: Flutter"
+          elif [[ -f "$PROJECT/gradlew" ]]; then
+            echo "PROJECT_KIND=android" >> "$GITHUB_ENV"
+            echo "Project type: Android Gradle"
+          fi
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Flutter
+        if: ${{ env.PROJECT_KIND == 'flutter' }}
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: "3.41.9"
+          cache: true
+
+      - name: Analyze Flutter project
+        if: ${{ env.PROJECT_KIND == 'flutter' }}
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          flutter pub get
+          flutter analyze
+
+      - name: Stop after analysis
+        if: ${{ inputs.only_analyze }}
+        run: echo "Mode analyze-only selesai; build APK dilewati."
+
+      - name: Build APK
+        if: ${{ !inputs.only_analyze }}
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$BUILD_TYPE" in debug|release) ;; *) echo "::error::build_type harus debug atau release"; exit 1 ;; esac
+          if [[ "$PROJECT_KIND" == "flutter" ]]; then
+            flutter pub get
+            flutter build apk "--$BUILD_TYPE"
+          elif [[ "$PROJECT_KIND" == "android" ]]; then
+            chmod +x gradlew
+            if [[ "$BUILD_TYPE" == "debug" ]]; then TASK=assembleDebug; else TASK=assembleRelease; fi
+            ./gradlew "$TASK"
+          else
+            echo "::error::Jenis project tidak dikenali."
+            exit 1
+          fi
+
+      - name: Find APK output
+        if: ${{ !inputs.only_analyze }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK_PATH="$(find "$PROJECT_DIR" -type f -name '*.apk' -print -quit)"
+          if [[ -z "$APK_PATH" ]]; then
+            echo "::error::Build selesai tetapi file APK tidak ditemukan."
+            exit 1
+          fi
+          echo "APK_PATH=$APK_PATH" >> "$GITHUB_ENV"
+          ls -lh "$APK_PATH"
+
+      - name: Upload APK artifact
+        if: ${{ !inputs.only_analyze }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: flutter-${{ inputs.build_type }}-${{ inputs.tag }}
+          path: ${{ env.APK_PATH }}
+          if-no-files-found: error
+          retention-days: 7
